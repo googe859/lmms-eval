@@ -24,6 +24,7 @@ from lmms_eval.api.registry import register_model
 from lmms_eval.models.model_utils.reasoning_model_utils import (
     parse_reasoning_model_answer,
 )
+from lmms_eval.models.model_utils.qwen_visual_pruner import ensure_qwen3_token_pruning_support
 
 try:
     from qwen_vl_utils import process_vision_info
@@ -58,8 +59,14 @@ class Qwen3_VL(lmms):
         **kwargs,
     ) -> None:
         super().__init__()
-        # Do not use kwargs for now
-        assert kwargs == {}, f"Unexpected kwargs: {kwargs}"
+        self.token_prune_mode = kwargs.pop("token_prune_mode", "none")
+        self.token_keep_ratio = float(kwargs.pop("token_keep_ratio", 1.0))
+        token_prune_requested = self.token_prune_mode not in (None, "none")
+        if token_prune_requested and not (0.0 < self.token_keep_ratio <= 1.0):
+            raise ValueError("token_keep_ratio must be within (0, 1] when token pruning is enabled.")
+        self._token_pruning_enabled = token_prune_requested and self.token_keep_ratio < 1.0
+        if kwargs:
+            eval_logger.debug(f"Ignoring unexpected kwargs: {kwargs}")
 
         # Validate attention implementation
         valid_attn_implementations = [None, "flash_attention_2", "sdpa", "eager"]
@@ -96,7 +103,15 @@ class Qwen3_VL(lmms):
         # check whether its an MoE model
         match = re.search(r"A\d+B", pretrained)
         model_fn = Qwen3VLMoeForConditionalGeneration if match else Qwen3VLForConditionalGeneration
+        ensure_qwen3_token_pruning_support()
         self._model = model_fn.from_pretrained(pretrained, **model_kwargs).eval()
+        if self._token_pruning_enabled:
+            if hasattr(self._model, "set_token_pruning"):
+                self._model.set_token_pruning(self.token_prune_mode, self.token_keep_ratio)
+            else:
+                raise RuntimeError(
+                    "token pruning was requested but the loaded Qwen3-VL weights do not expose set_token_pruning()."
+                )
         self.max_pixels = max_pixels
         self.min_pixels = min_pixels
         self.max_num_frames = max_num_frames
